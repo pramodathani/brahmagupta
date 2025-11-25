@@ -1,0 +1,16 @@
+[Unit]
+Description=Trading Machine Real Time Quote Service
+After=network.target redis-server.service mongod.service
+ 
+[Service]
+Type=simple
+User=pramod
+Group=pramod
+ExecStart=/home/pramod/Code/brahmagupta/scripts/real_time_quote_server.sh
+Restart=always
+WorkingDirectory=/tmp
+Nice=19
+LimitNOFILE=16384
+ 
+[Install]
+WantedBy=multi-user.target

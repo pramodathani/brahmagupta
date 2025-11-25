@@ -1,0 +1,199 @@
+#!/home/pramod/anaconda3/bin/python
+import sys
+import json
+import time
+import redis
+import logging
+import numpy as np
+import pandas as pd
+from pymongo import MongoClient
+
+sys.path.append('/home/pramod/trading_machine')
+from brokers.zerodha import *
+from util.config import *
+
+
+
+class DecodePacket:
+    """Decode binary packet from websocket"""
+
+    def __init__(self):
+        self._EXCHANGE_MAP = {
+            "nse": 1,
+            "nfo": 2,
+            "cds": 3,
+            "bse": 4,
+            "bfo": 5,
+            "bcd": 6,
+            "mcx": 7,
+            "mcxsx": 8,
+            "indices": 9,
+            "bsecds": 6
+        }
+
+    def _unpack_int(self, packet, start, end, byte_format='I'):
+        return struct.unpack(">" + byte_format, packet[start:end])[0]
+
+    def quote(self, packet):
+        """
+        Returns the quote.
+        """
+        packet = bytes.fromhex(packet)
+        instrument_token = self._unpack_int(packet, 0, 4)
+        segment = instrument_token & 0xff
+
+        if segment == self._EXCHANGE_MAP["cds"]:
+            divisor = 10000000.0
+        elif segment == self._EXCHANGE_MAP["bcd"]:
+            divisor = 1000.0
+        else:
+            divisor = 100.0
+
+        tradeable = False if segment == self._EXCHANGE_MAP["indices"] else True
+
+        quote = {
+            "tradeable": tradeable,
+            "mode": "full",
+            "instrument_token": instrument_token,
+            "last_traded_price": self._unpack_int(packet, 4, 8) / divisor,
+            "last_traded_quantity": self._unpack_int(packet, 8, 12),
+            "average_traded_price": self._unpack_int(packet, 12, 16) / divisor,
+            "volume_traded_today": self._unpack_int(packet, 16, 20),
+            "total_bid_quantity": self._unpack_int(packet, 20, 24),
+            "total_offer_quantity": self._unpack_int(packet, 24, 28),
+            "ohlc": {
+                "open": self._unpack_int(packet, 28, 32) / divisor,
+                "high": self._unpack_int(packet, 32, 36) / divisor,
+                "low": self._unpack_int(packet, 36, 40) / divisor,
+                "close": self._unpack_int(packet, 40, 44) / divisor
+            },
+            "last_trade_time": datetime.fromtimestamp(self._unpack_int(packet, 44, 48)).strftime("%Y-%m-%d %H:%M:%S.%f"),
+            "oi": self._unpack_int(packet, 48, 52),
+            "oi_day_high": self._unpack_int(packet, 52, 56),
+            "oi_day_low": self._unpack_int(packet, 56, 60),
+            "exchange_timestamp": datetime.fromtimestamp(self._unpack_int(packet, 60, 64)).strftime("%Y-%m-%d %H:%M:%S.%f"),
+            "arrival_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        }
+
+        quote["change"] = 0
+        if (quote["ohlc"]["close"] != 0):
+            quote["change"] = (quote["last_traded_price"] - quote["ohlc"]["close"]) * 100 / quote["ohlc"]["close"]
+
+        depth = {
+            "buy": [],
+            "sell": []
+        }
+
+        for i, p in enumerate(range(64, len(packet), 12)):
+            depth["sell" if i >= 5 else "buy"].append({
+                "quantity": self._unpack_int(packet, p, p + 4),
+                "price": self._unpack_int(packet, p + 4, p + 8) / divisor,
+                "orders": self._unpack_int(packet, p + 8, p + 10, byte_format="H")
+            })
+
+        quote["depth"] = depth
+        quote2 = {
+            "tradeable": tradeable,
+            "mode": "full",
+            "instrument_token": quote["instrument_token"],
+            "last_traded_price": quote["last_traded_price"],
+            "last_traded_quantity": quote["last_traded_quantity"],
+            "average_traded_price": quote["average_traded_price"],
+            "volume_traded_today": quote["volume_traded_today"],
+            "total_bid_quantity": quote["total_bid_quantity"],
+            "total_offer_quantity": quote["total_offer_quantity"],
+            "open": quote["ohlc"]["open"],
+            "high": quote["ohlc"]["high"],
+            "low": quote["ohlc"]["low"],    
+            "close": quote["ohlc"]["close"],
+            "last_trade_time": quote["last_trade_time"],
+            "oi": quote["oi"],
+            "oi_day_high": quote["oi_day_high"],
+            "oi_day_low": quote["oi_day_low"],
+            "exchange_timestamp": quote["exchange_timestamp"],
+            "arrival_timestamp": quote["arrival_timestamp"],
+            "change": quote["change"],
+            "bid_quantity_1": quote["depth"]["buy"][0]["quantity"],
+            "bid_price_1": quote["depth"]["buy"][0]["price"],
+            "bid_orders_1": quote["depth"]["buy"][0]["orders"],
+            "bid_quantity_2": quote["depth"]["buy"][1]["quantity"],
+            "bid_price_2": quote["depth"]["buy"][1]["price"],
+            "bid_orders_2": quote["depth"]["buy"][1]["orders"],
+            "bid_quantity_3": quote["depth"]["buy"][2]["quantity"],
+            "bid_price_3": quote["depth"]["buy"][2]["price"],
+            "bid_orders_3": quote["depth"]["buy"][2]["orders"],
+            "bid_quantity_4": quote["depth"]["buy"][3]["quantity"],
+            "bid_price_4": quote["depth"]["buy"][3]["price"],
+            "bid_orders_4": quote["depth"]["buy"][3]["orders"],
+            "bid_quantity_5": quote["depth"]["buy"][4]["quantity"],
+            "bid_price_5": quote["depth"]["buy"][4]["price"],
+            "bid_orders_5": quote["depth"]["buy"][4]["orders"],
+            "ask_quantity_1": quote["depth"]["sell"][0]["quantity"],
+            "ask_price_1": quote["depth"]["sell"][0]["price"],
+            "ask_orders_1": quote["depth"]["sell"][0]["orders"],
+            "ask_quantity_2": quote["depth"]["sell"][1]["quantity"],
+            "ask_price_2": quote["depth"]["sell"][1]["price"],
+            "ask_orders_2": quote["depth"]["sell"][1]["orders"],
+            "ask_quantity_3": quote["depth"]["sell"][2]["quantity"],
+            "ask_price_3": quote["depth"]["sell"][2]["price"],
+            "ask_orders_3": quote["depth"]["sell"][2]["orders"],
+            "ask_quantity_4": quote["depth"]["sell"][3]["quantity"],
+            "ask_price_4": quote["depth"]["sell"][3]["price"],
+            "ask_orders_4": quote["depth"]["sell"][3]["orders"],
+            "ask_quantity_5": quote["depth"]["sell"][4]["quantity"],
+            "ask_price_5": quote["depth"]["sell"][4]["price"],
+            "ask_orders_5": quote["depth"]["sell"][4]["orders"]
+        }
+        return quote2
+
+
+cache = redis.Redis(host=redis_config['host'], port=redis_config['port'], db=redis_config['db'], decode_responses=True)
+decoder = DecodePacket()
+
+instruments_map = cache.hgetall('zerodha_instruments_map')
+instruments_map = {key: value for key, value in instruments_map.items()}
+instruments_map = pd.DataFrame(instruments_map.items(), columns=['instrument_token', 'instrument_id'])
+instruments_map['instrument_token'] = instruments_map['instrument_token'].astype('int64')
+
+while True:
+    all_quotes_channels = sorted(cache.keys('quotes*'))
+    quotes_channels_df = pd.DataFrame(all_quotes_channels, columns=['channel'])
+    quotes_channels_df['length'] = quotes_channels_df['channel'].apply(lambda x: cache.llen(x))
+    quotes_channels_df.sort_values(by='channel', ascending=True, inplace=True)
+    quotes_channels_df.reset_index(drop=True, inplace=True)
+    
+    all_quotes_channels = quotes_channels_df['channel'].values
+    print(quotes_channels_df)
+
+    for quotes_channel in all_quotes_channels:
+        all_decoded_quotes = []
+        number_of_quotes = cache.llen(quotes_channel)
+        if number_of_quotes > 0:
+            # x = cache.rpop(quotes_channel, number_of_quotes-2)
+            x = cache.lrange(quotes_channel, 0, -1)
+            cache.delete(quotes_channel)
+            # print(f"Fetched {len(x)} quotes from {quotes_channel}")            
+            for i in x:
+                if len(i) == 368:
+                    quote = decoder.quote(i)
+                    all_decoded_quotes.append(quote)
+        # print(f"{quotes_channel}\t{len(all_decoded_quotes)}")
+        all_decoded_quotes = pd.DataFrame(all_decoded_quotes)
+        if all_decoded_quotes.empty:
+            continue
+
+        all_decoded_quotes = pd.merge(all_decoded_quotes, instruments_map, on='instrument_token', how='left')
+        all_decoded_quotes.sort_values(by='exchange_timestamp', inplace=True)
+        
+        instrument_ids = all_decoded_quotes['instrument_id'].unique()
+        instrument_ids = sorted(instrument_ids)
+        
+        number_of_instruments = len(instrument_ids)        
+        for i in range(number_of_instruments):
+            instrument_id = instrument_ids[i]
+            quote = all_decoded_quotes[all_decoded_quotes['instrument_id'] == instrument_id]
+            quote2 = quote.sort_values(by='exchange_timestamp')
+            print(f"{quotes_channel:20}{instrument_id:50}{i+1}/{number_of_instruments}")
+            quote2.to_csv(f'/home/pramod/Documents/quotes/{instrument_id}.csv', mode='a', header=False, index=False)
+    time.sleep(5*60)
+    

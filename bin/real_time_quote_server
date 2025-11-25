@@ -1,0 +1,109 @@
+#!/home/pramod/anaconda3/bin/python
+import os
+import sys
+import csv
+import json
+import time
+import redis
+import struct
+import logging
+import pymongo
+import threading
+import websocket
+import pandas as pd
+from six import StringIO
+from datetime import datetime
+sys.path.append('/home/pramod/Code/trading_machine')
+from util.config import *
+
+from brokers.zerodha import *
+from brokers.exceptions import *
+
+### setup cache and mongo db connections
+cache = redis.Redis(host=redis_config['host'], port=redis_config['port'], db=redis_config['db'])
+mongo_client = pymongo.MongoClient(mongodb_config['connection_string'])
+mongo_db = mongo_client[mongodb_config['db']]
+
+while True:
+    try:
+        cache.ping()
+        print("Connected to Redis server.")
+    except redis.exceptions.ConnectionError:
+        print("Redis server is not running. Exiting...")
+        sys.exit(1)
+    except redis.exceptions.BusyLoadingError:
+        print("Redis server is still loading. Waiting...")
+        time.sleep(1)
+    else:
+        break
+
+
+### clear cache
+# cache.flushall()
+
+### Login
+print("Logging in...")
+rest_api = ZerodhaRestAPI()
+rest_api.connect()
+print(rest_api.get(url='https://api.kite.trade/user/profile'))
+
+
+### Update Instruments
+print("Updating instruments...")
+rest_api = ZerodhaRestAPI()
+data = rest_api.get(url="https://api.kite.trade/instruments")
+records = []
+reader = csv.DictReader(StringIO(data))
+for row in reader:
+    row['instrument_token'] = int(row['instrument_token'])
+    row['last_price'] = float(row['last_price'])
+    row['strike'] = float(row['strike'])
+    row['tick_size'] = float(row['tick_size'])
+    row['lot_size'] = int(row['lot_size'])
+    records.append(row)
+records = pd.DataFrame(records)
+records['id'] = records['exchange'] + ':' + records['tradingsymbol']
+records = records[["id", "instrument_token", "exchange_token", "tradingsymbol", "name", "last_price", "expiry", "strike", "tick_size", "lot_size", "instrument_type", "segment", "exchange"]]
+records.loc[records['name']=='NIFTY', 'name'] = 'NIFTY 50'
+records.loc[records['name']=='BANKNIFTY', 'name'] = 'NIFTY BANK'
+records.loc[records['name']=='FINNIFTY', 'name'] = 'NIFTY FIN SERVICE'
+records.loc[records['name']=='MIDCPNIFTY', 'name'] = 'NIFTY MIDCAP 100'
+mongo_db["zerodha_instruments"].drop()
+mongo_db["zerodha_instruments"].insert_many(records.to_dict('records'))
+
+### Update Instruments Map
+print("Updating instruments map...")
+instruments_map = records[["instrument_token", "id"]]
+mongo_db["zerodha_instruments_map"].drop()
+mongo_db["zerodha_instruments_map"].insert_many(instruments_map.to_dict('records'))
+
+### Load configurations to cache
+print("Loading configurations to cache...")
+cache = redis.Redis(host=redis_config['host'], port=redis_config['port'], db=redis_config['db'])
+mongo_client = pymongo.MongoClient(mongodb_config['connection_string'])
+mongo_db = mongo_client[mongodb_config['db']]
+
+settings = mongo_db["zerodha_settings"].find_one({}, {"_id": 0})
+cache.set("zerodha_settings", json.dumps(settings))
+
+last_login = mongo_db["zerodha_last_login"].find_one({}, {"_id": 0})
+cache.set("zerodha_last_login", json.dumps(last_login))
+
+risk_free_rate = mongo_db["risk_free_rate"].find_one({}, {"_id": 0})
+cache.set("risk_free_rate", risk_free_rate["risk_free_rate"])
+
+instruments = mongo_db["zerodha_instruments"].find({}, {"_id": 0})
+for instrument in instruments:
+    cache.hset("zerodha_instruments", instrument["id"], json.dumps(instrument))
+
+instruments_map = mongo_db["zerodha_instruments_map"].find({}, {"_id": 0})
+for instrument_map in instruments_map:
+    cache.hset("zerodha_instruments_map", instrument_map["instrument_token"], instrument_map["id"])
+
+instruments = mongo_db["zerodha_instruments"].find({}, {"_id": 0})
+all_instruments = pd.DataFrame(list(instruments))
+
+### start the websockets service
+print("Starting websockets service...")
+websocket_server = ZerodhaWebSocketServer(numbers_of_securities_per_thread=4000)
+websocket_server.run_all_websockets()
